@@ -9,7 +9,7 @@ import math
 import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-    QSplitter, QPushButton, QLabel, QLineEdit, QDoubleValidator,
+    QSplitter, QPushButton, QLabel, QLineEdit,
     QMessageBox, QInputDialog, QDialog, QComboBox, QProgressDialog,
     QSizePolicy, QStatusBar
 )
@@ -17,7 +17,8 @@ from PyQt5.QtCore import (
     Qt, QPointF, QRectF, QThread, pyqtSignal, QObject
 )
 from PyQt5.QtGui import (
-    QPainter, QPen, QBrush, QColor, QPainterPath, QFont, QCursor
+    QPainter, QPen, QBrush, QColor, QPainterPath, QFont, QCursor,
+    QDoubleValidator
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
