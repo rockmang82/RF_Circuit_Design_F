@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QPushButton, QLabel, QLineEdit,
     QMessageBox, QInputDialog, QDialog, QComboBox, QProgressDialog,
-    QSizePolicy, QStatusBar
+    QSizePolicy, QStatusBar, QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PyQt5.QtCore import (
     Qt, QPointF, QRectF, QThread, pyqtSignal, QObject
@@ -236,6 +236,80 @@ class MNAWorker(QObject):
         if comp_id in ('port_plus', 'port_gnd'):
             return comp_id
         return (comp_id, pin_idx)
+
+
+# ──────────────────────────────────────────────
+# MNA 단일 주파수 헬퍼 (민감도 분석용)
+# ──────────────────────────────────────────────
+
+def mna_solve_one(components, wires, f_hz):
+    """단일 주파수 f_hz(Hz)에서 MNA로 입력 임피던스 Z 계산. 실패시 None 반환."""
+    all_keys = []
+    for comp in components:
+        all_keys.append((comp.id, 0))
+        all_keys.append((comp.id, 1))
+    all_keys.append('port_plus')
+    all_keys.append('port_gnd')
+
+    parent = {k: k for k in all_keys}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    def wkey(comp_id, pin_idx):
+        if comp_id in ('port_plus', 'port_gnd'):
+            return comp_id
+        return (comp_id, pin_idx)
+
+    for wire in wires:
+        if not wire.is_complete():
+            continue
+        sk = wkey(wire.start_comp_id, wire.start_pin_idx)
+        ek = wkey(wire.end_comp_id, wire.end_pin_idx)
+        if sk in parent and ek in parent:
+            union(sk, ek)
+
+    roots = list({find(k) for k in all_keys})
+    root_to_num = {r: i for i, r in enumerate(roots)}
+    node_map = {k: root_to_num[find(k)] for k in all_keys}
+    n_nodes = len(roots)
+    gnd_node = node_map.get('port_gnd')
+    port_plus_node = node_map.get('port_plus')
+
+    if port_plus_node is None or gnd_node is None:
+        return None
+
+    Y = np.zeros((n_nodes, n_nodes), dtype=complex)
+    for comp in components:
+        y = comp.admittance(f_hz)
+        n0 = node_map.get((comp.id, 0))
+        n1 = node_map.get((comp.id, 1))
+        if n0 is None or n1 is None:
+            continue
+        Y[n0, n0] += y
+        Y[n1, n1] += y
+        Y[n0, n1] -= y
+        Y[n1, n0] -= y
+
+    rows = [k for k in range(n_nodes) if k != gnd_node]
+    Y_red = Y[np.ix_(rows, rows)]
+    pp_idx = port_plus_node if port_plus_node < gnd_node else port_plus_node - 1
+    I = np.zeros(len(rows), dtype=complex)
+    I[pp_idx] = 1.0
+
+    try:
+        V = np.linalg.solve(Y_red, I)
+        return V[pp_idx]
+    except np.linalg.LinAlgError:
+        return None
 
 
 # ──────────────────────────────────────────────
@@ -1136,6 +1210,218 @@ class AdvancedWindow(QDialog):
 
 
 # ──────────────────────────────────────────────
+# 민감도 분석 워커
+# ──────────────────────────────────────────────
+
+class SensitivityWorker(QObject):
+    """수치 미분으로 각 소자의 임피던스 민감도 계산"""
+    finished = pyqtSignal(object)   # list of dict
+    error = pyqtSignal(str)
+
+    def __init__(self, components, wires, f_hz, tolerance_pct):
+        super().__init__()
+        import copy
+        self.components = copy.deepcopy(components)
+        self.wires = wires
+        self.f_hz = f_hz
+        self.eps = tolerance_pct / 100.0   # 상대 섭동량
+
+    def run(self):
+        try:
+            Z0 = mna_solve_one(self.components, self.wires, self.f_hz)
+            if Z0 is None or abs(Z0) == 0:
+                self.error.emit('기준 임피던스 계산 실패 — Port가 올바르게 연결됐는지 확인하세요')
+                return
+
+            # 타입별 일련번호
+            type_idx = {}
+            results = []
+
+            for comp in self.components:
+                if comp.value is None or comp.value == 0:
+                    continue
+                t = comp.type
+                type_idx[t] = type_idx.get(t, 0) + 1
+                name = f'{t}{type_idx[t]}'
+                unit = {'R': 'Ω', 'L': 'nH', 'C': 'pF'}[t]
+                xi = comp.value
+
+                # 중앙 차분: xi*(1±eps)
+                comp.value = xi * (1.0 + self.eps)
+                Z_plus = mna_solve_one(self.components, self.wires, self.f_hz)
+                comp.value = xi * (1.0 - self.eps)
+                Z_minus = mna_solve_one(self.components, self.wires, self.f_hz)
+                comp.value = xi  # 복원
+
+                if Z_plus is None or Z_minus is None:
+                    continue
+
+                dZ = Z_plus - Z_minus
+                # 절대 민감도 |ΔZ/ΔXi| — Ω/unit (실수부 부호 유지)
+                abs_sens = (dZ / (2.0 * xi * self.eps)).real
+                # 정규화 민감도 (ΔZ/Z) / (ΔXi/Xi) = dZ/(2*Z0*eps)
+                norm_sens = (dZ / (2.0 * Z0 * self.eps)).real
+
+                # 값 표시 문자열 (정수면 정수형, 소수면 소수형)
+                if xi == int(xi):
+                    val_str = f'{int(xi)} {unit}'
+                else:
+                    val_str = f'{xi} {unit}'
+
+                results.append({
+                    'name': name,
+                    'type': t,
+                    'value': xi,
+                    'unit': unit,
+                    'val_str': val_str,
+                    'abs_sens': abs_sens,
+                    'norm_sens': norm_sens,
+                })
+
+            if not results:
+                self.error.emit('민감도를 계산할 소자가 없습니다')
+                return
+
+            # 랭킹: |norm_sens| 내림차순
+            results.sort(key=lambda r: -abs(r['norm_sens']))
+            for i, r in enumerate(results):
+                r['rank'] = i + 1
+
+            self.finished.emit(results)
+
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ──────────────────────────────────────────────
+# 민감도 결과 윈도우
+# ──────────────────────────────────────────────
+
+class SensitivityWindow(QDialog):
+    """Sensitivity Analysis Results 창"""
+
+    def __init__(self, f_mhz, tolerance_pct, results, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Sensitivity Analysis Results')
+        self.setWindowFlags(self.windowFlags() | Qt.Window)
+        self.resize(1020, 480)
+        self.setMinimumSize(760, 380)
+        self.f_mhz = f_mhz
+        self.tolerance_pct = tolerance_pct
+        self.results = results
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        # ── 헤더 ──
+        n = len(self.results)
+        header = QLabel(
+            f'분석 주파수: {self.f_mhz:.3f} MHz   |   소자 수: {n}개'
+        )
+        font = QFont()
+        font.setPointSize(12)
+        font.setBold(True)
+        header.setFont(font)
+        header.setStyleSheet('padding: 4px 2px;')
+        layout.addWidget(header)
+
+        # ── 본문 (좌: 테이블 / 우: 토네이도 차트) ──
+        content = QHBoxLayout()
+        content.setSpacing(10)
+
+        # ── 좌: 테이블 ──
+        table = QTableWidget(n, 6)
+        table.setHorizontalHeaderLabels(
+            ['Component', 'Value', 'Tolerance', '|ΔZ/ΔXi|', 'Norm. S', 'Rank']
+        )
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.verticalHeader().setVisible(True)
+        table.setAlternatingRowColors(False)
+
+        tol_str = f'±{self.tolerance_pct:.1f}%'
+        sorted_r = sorted(self.results, key=lambda r: r['rank'])
+        for row_idx, r in enumerate(sorted_r):
+            texts = [
+                r['name'],
+                r['val_str'],
+                tol_str,
+                f"{r['abs_sens']:.3f}",
+                f"{r['norm_sens']:.4f}",
+                str(r['rank']),
+            ]
+            for col, text in enumerate(texts):
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignCenter)
+                # Rank 1 행: 연분홍 배경
+                if r['rank'] == 1:
+                    item.setBackground(QColor('#FFEBEE'))
+                # L 소자: 연파랑 텍스트
+                if r['type'] == 'L':
+                    item.setForeground(QColor('#1565C0'))
+                table.setItem(row_idx, col, item)
+
+        content.addWidget(table, stretch=45)
+
+        # ── 우: 토네이도 차트 ──
+        fig = Figure(facecolor='white')
+        canvas = FigureCanvas(fig)
+        ax = fig.add_subplot(111)
+
+        # rank 순으로 정렬 (rank1=top)
+        n = len(sorted_r)
+        y_pos = list(range(n - 1, -1, -1))   # [n-1, ..., 0]
+        names    = [r['name']     for r in sorted_r]
+        norm_v   = [r['norm_sens'] for r in sorted_r]
+        abs_v    = [r['abs_sens']  for r in sorted_r]
+
+        # 파란 수평 막대 (정규화 민감도)
+        bars = ax.barh(y_pos, norm_v, color='#5C9BD6', height=0.5, zorder=3)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(names, fontsize=9)
+        ax.set_xlabel('Normalized Sensitivity (ΔZ/Z per ΔXi/Xi)', fontsize=9)
+        ax.grid(True, axis='x', color='#E0E0E0', linestyle='--', zorder=1)
+        ax.set_facecolor('white')
+
+        # 막대 내부/측 S= 레이블
+        x_range = max(abs(v) for v in norm_v) if norm_v else 1
+        for yi, nv in zip(y_pos, norm_v):
+            lbl = f'S={nv:.3f}'
+            inside = abs(nv) > x_range * 0.25
+            if nv < 0:
+                xpos = nv / 2 if inside else nv - x_range * 0.02
+                ha = 'center' if inside else 'right'
+            else:
+                xpos = nv / 2 if inside else nv + x_range * 0.02
+                ha = 'center' if inside else 'left'
+            color = 'white' if inside else '#333333'
+            ax.text(xpos, yi, lbl, va='center', ha=ha,
+                    fontsize=8, color=color, zorder=5)
+
+        # 상단 x축 (절대 민감도, 오렌지)
+        ax2 = ax.twiny()
+        ax2.set_xlabel('Absolute Sensitivity |ΔZ/ΔXi| (Ω/unit)', color='#FF9800', fontsize=9)
+        ax2.tick_params(axis='x', colors='#FF9800', labelsize=8)
+        ax2.spines['top'].set_edgecolor('#FF9800')
+        # 오렌지 다이아몬드
+        ax2.plot(abs_v, y_pos, 'D', color='#FF9800', markersize=8, zorder=6)
+
+        ax.set_title(
+            f'Tornado Chart — Local Sensitivity @ {self.f_mhz:.3f} MHz',
+            fontsize=10, pad=8
+        )
+
+        fig.tight_layout()
+        content.addWidget(canvas, stretch=55)
+
+        layout.addLayout(content)
+
+
+# ──────────────────────────────────────────────
 # 메인 윈도우
 # ──────────────────────────────────────────────
 
@@ -1208,9 +1494,7 @@ class MainWindow(QMainWindow):
         self.sens_btn.setStyleSheet(
             'background-color: #4A90D9; color: white; font-size: 10pt; border-radius: 3px;'
         )
-        self.sens_btn.clicked.connect(
-            lambda: QMessageBox.information(self, '안내', '추후 구현 예정')
-        )
+        self.sens_btn.clicked.connect(self._open_sensitivity)
         toolbar_layout.addWidget(self.sens_btn)
 
         toolbar_layout.addStretch()
@@ -1270,6 +1554,88 @@ class MainWindow(QMainWindow):
         else:
             self.advanced_win.raise_()
             self.advanced_win.activateWindow()
+
+    def _open_sensitivity(self):
+        """Sensitivity Analysis 버튼 처리"""
+        # Cal 완료 여부 확인
+        if self.last_freqs is None or self.last_Z is None:
+            QMessageBox.warning(self, '안내',
+                                'Cal 버튼으로 먼저 회로를 계산하세요')
+            return
+
+        # 회로 유효성 검증
+        valid, err = self.circuit_canvas.validate_circuit()
+        if not valid:
+            QMessageBox.warning(self, '회로 오류', err)
+            return
+
+        # 분석 주파수 입력 (기본값: 주파수 범위 중간)
+        f_default = (self.last_freqs[0] + self.last_freqs[-1]) / 2
+        f_str, ok = QInputDialog.getText(
+            self, '민감도 분석 — 주파수 설정',
+            '분석 주파수 (MHz):',
+            text=f'{f_default:.3f}'
+        )
+        if not ok or not f_str.strip():
+            return
+        try:
+            f_mhz = float(f_str.strip())
+        except ValueError:
+            QMessageBox.warning(self, '입력 오류', '주파수를 숫자로 입력하세요')
+            return
+        if f_mhz <= 0:
+            QMessageBox.warning(self, '입력 오류', '주파수는 0보다 커야 합니다')
+            return
+
+        # 공차 입력
+        tol_str, ok2 = QInputDialog.getText(
+            self, '민감도 분석 — 공차 설정',
+            '공차 (%, 예: 5.0):',
+            text='5.0'
+        )
+        if not ok2:
+            return
+        try:
+            tolerance = float(tol_str.strip()) if tol_str.strip() else 5.0
+        except ValueError:
+            tolerance = 5.0
+
+        self._run_sensitivity(f_mhz, tolerance)
+
+    def _run_sensitivity(self, f_mhz, tolerance):
+        """SensitivityWorker QThread 실행"""
+        self.sens_btn.setEnabled(False)
+        self.statusBar().showMessage('민감도 분석 중...')
+
+        self._sens_thread = QThread()
+        self._sens_worker = SensitivityWorker(
+            components=self.circuit_canvas.components,
+            wires=self.circuit_canvas.wires,
+            f_hz=f_mhz * 1e6,
+            tolerance_pct=tolerance,
+        )
+        self._sens_worker.moveToThread(self._sens_thread)
+        self._sens_thread.started.connect(self._sens_worker.run)
+        self._sens_worker.finished.connect(
+            lambda res: self._on_sensitivity_finished(f_mhz, tolerance, res)
+        )
+        self._sens_worker.error.connect(self._on_sensitivity_error)
+        self._sens_worker.finished.connect(self._sens_thread.quit)
+        self._sens_worker.error.connect(self._sens_thread.quit)
+        self._sens_thread.start()
+
+    def _on_sensitivity_finished(self, f_mhz, tolerance, results):
+        self.sens_btn.setEnabled(True)
+        self.statusBar().showMessage(
+            f'민감도 분석 완료 @ {f_mhz:.3f} MHz  ({len(results)}개 소자)'
+        )
+        win = SensitivityWindow(f_mhz, tolerance, results, self)
+        win.show()
+
+    def _on_sensitivity_error(self, msg):
+        self.sens_btn.setEnabled(True)
+        QMessageBox.warning(self, '민감도 오류', f'민감도 분석 오류:\n{msg}')
+        self.statusBar().showMessage('민감도 분석 오류')
 
     def _on_calculate(self):
         """계산 버튼 처리"""
