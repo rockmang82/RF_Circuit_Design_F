@@ -1215,16 +1215,16 @@ class AdvancedWindow(QDialog):
 
 class SensitivityWorker(QObject):
     """수치 미분으로 각 소자의 임피던스 민감도 계산"""
-    finished = pyqtSignal(object)   # list of dict
+    finished = pyqtSignal(float, object)   # z_nominal_abs, list of dict
     error = pyqtSignal(str)
 
-    def __init__(self, components, wires, f_hz, tolerance_pct):
+    def __init__(self, components, wires, f_hz):
         super().__init__()
         import copy
         self.components = copy.deepcopy(components)
         self.wires = wires
         self.f_hz = f_hz
-        self.eps = tolerance_pct / 100.0   # 상대 섭동량
+        self.eps = 0.01   # 고정 상대 섭동량 (1%, 수치 미분 안정성 확보)
 
     def run(self):
         try:
@@ -1287,7 +1287,7 @@ class SensitivityWorker(QObject):
             for i, r in enumerate(results):
                 r['rank'] = i + 1
 
-            self.finished.emit(results)
+            self.finished.emit(abs(Z0), results)
 
         except Exception as e:
             self.error.emit(str(e))
@@ -1300,14 +1300,14 @@ class SensitivityWorker(QObject):
 class SensitivityWindow(QDialog):
     """Sensitivity Analysis Results 창"""
 
-    def __init__(self, f_mhz, tolerance_pct, results, parent=None):
+    def __init__(self, f_mhz, z_nominal, results, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Sensitivity Analysis Results')
         self.setWindowFlags(self.windowFlags() | Qt.Window)
         self.resize(1020, 480)
         self.setMinimumSize(760, 380)
         self.f_mhz = f_mhz
-        self.tolerance_pct = tolerance_pct
+        self.z_nominal = z_nominal   # |Z_nominal| in Ω
         self.results = results
         self._build_ui()
 
@@ -1319,7 +1319,8 @@ class SensitivityWindow(QDialog):
         # ── 헤더 ──
         n = len(self.results)
         header = QLabel(
-            f'분석 주파수: {self.f_mhz:.3f} MHz   |   소자 수: {n}개'
+            f'분석 주파수: {self.f_mhz:.3f} MHz   |   '
+            f'Z_nominal: {self.z_nominal:.2f} Ω   |   소자 수: {n}개'
         )
         font = QFont()
         font.setPointSize(12)
@@ -1333,9 +1334,9 @@ class SensitivityWindow(QDialog):
         content.setSpacing(10)
 
         # ── 좌: 테이블 ──
-        table = QTableWidget(n, 6)
+        table = QTableWidget(n, 5)
         table.setHorizontalHeaderLabels(
-            ['Component', 'Value', 'Tolerance', '|ΔZ/ΔXi|', 'Norm. S', 'Rank']
+            ['Component', 'Value', 'ΔZ/ΔXi', 'Norm. S', 'Rank']
         )
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -1343,13 +1344,11 @@ class SensitivityWindow(QDialog):
         table.verticalHeader().setVisible(True)
         table.setAlternatingRowColors(False)
 
-        tol_str = f'±{self.tolerance_pct:.1f}%'
         sorted_r = sorted(self.results, key=lambda r: r['rank'])
         for row_idx, r in enumerate(sorted_r):
             texts = [
                 r['name'],
                 r['val_str'],
-                tol_str,
                 f"{r['abs_sens']:.3f}",
                 f"{r['norm_sens']:.4f}",
                 str(r['rank']),
@@ -1488,26 +1487,33 @@ class MainWindow(QMainWindow):
 
         toolbar_layout.addStretch()
 
-        # Sensitivity Analysis 버튼 (중앙)
-        self.sens_btn = QPushButton('Sensitivity Analysis')
-        self.sens_btn.setFixedHeight(28)
-        self.sens_btn.setStyleSheet(
-            'background-color: #4A90D9; color: white; font-size: 10pt; border-radius: 3px;'
-        )
-        self.sens_btn.clicked.connect(self._open_sensitivity)
-        toolbar_layout.addWidget(self.sens_btn)
-
-        toolbar_layout.addStretch()
-
         main_layout.addWidget(toolbar_widget)
 
         # ── 본문: 분할 패널 ──
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
 
-        # 창1: 회로 설계
+        # 창1: 회로 설계 (래퍼 위젯으로 감싸기)
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(2)
+
+        # Sensitivity Analysis 버튼 (창1 우측 상단, Advanced 버튼과 동일 높이)
+        sens_row = QHBoxLayout()
+        sens_row.addStretch()
+        self.sens_btn = QPushButton('Sensitivity Analysis')
+        self.sens_btn.setFixedHeight(28)    # Advanced 버튼과 동일 높이
+        self.sens_btn.setStyleSheet(
+            'background-color: #4A90D9; color: white; font-size: 10pt; border-radius: 3px;'
+        )
+        self.sens_btn.clicked.connect(self._open_sensitivity)
+        sens_row.addWidget(self.sens_btn)
+        left_layout.addLayout(sens_row)
+
         self.circuit_canvas = CircuitCanvas()
-        splitter.addWidget(self.circuit_canvas)
+        left_layout.addWidget(self.circuit_canvas, stretch=1)
+        splitter.addWidget(left_widget)
 
         # 창2: Smith Chart + Advanced 버튼
         right_widget = QWidget()
@@ -1587,22 +1593,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, '입력 오류', '주파수는 0보다 커야 합니다')
             return
 
-        # 공차 입력
-        tol_str, ok2 = QInputDialog.getText(
-            self, '민감도 분석 — 공차 설정',
-            '공차 (%, 예: 5.0):',
-            text='5.0'
-        )
-        if not ok2:
-            return
-        try:
-            tolerance = float(tol_str.strip()) if tol_str.strip() else 5.0
-        except ValueError:
-            tolerance = 5.0
+        self._run_sensitivity(f_mhz)
 
-        self._run_sensitivity(f_mhz, tolerance)
-
-    def _run_sensitivity(self, f_mhz, tolerance):
+    def _run_sensitivity(self, f_mhz):
         """SensitivityWorker QThread 실행"""
         self.sens_btn.setEnabled(False)
         self.statusBar().showMessage('민감도 분석 중...')
@@ -1612,24 +1605,23 @@ class MainWindow(QMainWindow):
             components=self.circuit_canvas.components,
             wires=self.circuit_canvas.wires,
             f_hz=f_mhz * 1e6,
-            tolerance_pct=tolerance,
         )
         self._sens_worker.moveToThread(self._sens_thread)
         self._sens_thread.started.connect(self._sens_worker.run)
         self._sens_worker.finished.connect(
-            lambda res: self._on_sensitivity_finished(f_mhz, tolerance, res)
+            lambda z_nom, res: self._on_sensitivity_finished(f_mhz, z_nom, res)
         )
         self._sens_worker.error.connect(self._on_sensitivity_error)
         self._sens_worker.finished.connect(self._sens_thread.quit)
         self._sens_worker.error.connect(self._sens_thread.quit)
         self._sens_thread.start()
 
-    def _on_sensitivity_finished(self, f_mhz, tolerance, results):
+    def _on_sensitivity_finished(self, f_mhz, z_nominal, results):
         self.sens_btn.setEnabled(True)
         self.statusBar().showMessage(
             f'민감도 분석 완료 @ {f_mhz:.3f} MHz  ({len(results)}개 소자)'
         )
-        win = SensitivityWindow(f_mhz, tolerance, results, self)
+        win = SensitivityWindow(f_mhz, z_nominal, results, self)
         win.show()
 
     def _on_sensitivity_error(self, msg):
