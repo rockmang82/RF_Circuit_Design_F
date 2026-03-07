@@ -44,6 +44,7 @@ class Component:
         self.horizontal = True      # True=수평, False=수직
         self.selected = False
         self.error_highlight = False
+        self.name = None            # 예: "R1", "C2", "L1" — 배치 시 자동 부여
 
     def get_pins(self):
         """소자의 두 핀 좌표 반환 [(x1,y1), (x2,y2)]"""
@@ -340,21 +341,37 @@ class CircuitCanvas(QWidget):
         self.components = []   # list[Component]
         self.wires = []        # list[Wire]
 
+        # 소자 타입별 번호 카운터 (삭제해도 감소하지 않음)
+        self._type_counters = {'R': 0, 'L': 0, 'C': 0}
+
         # 배치 모드
         self.place_mode = None       # 'R', 'L', 'C' or None
         self.ghost_pos = None        # (x, y) 고스트 위치
 
-        # 선택
+        # 선택 (단일)
         self.selected_comp = None
 
-        # 드래그 이동
+        # 복수 선택
+        self.selected_components = set()   # 선택된 소자 id 집합
+
+        # 드래그 이동 (단일)
         self.dragging = False
         self.drag_origin = None      # 드래그 시작 소자 위치
+
+        # 복수 드래그 이동
+        self.multi_dragging = False
+        self.multi_drag_origin = None    # (x, y) 드래그 시작 마우스 위치
 
         # 와이어링 모드
         self.wiring = False
         self.wire_start = None       # (comp_id_or_port, pin_idx, x, y)
         self.wire_mouse_pos = None   # 현재 마우스 위치
+
+        # 러버밴드 선택
+        self.rubber_band_active = False
+        self.rubber_band_origin = None   # (x, y) 드래그 시작점
+        self.rubber_band_rect = None     # QRectF 선택 영역
+        self._press_pos = None           # 마우스 Press 시작 위치
 
         # Port 위치 (캔버스 크기에 따라 동적 계산)
         self._update_port_positions()
@@ -432,6 +449,8 @@ class CircuitCanvas(QWidget):
         if self.place_mode:
             # 배치 확정
             comp = Component(self.place_mode, sx, sy)
+            self._type_counters[self.place_mode] += 1
+            comp.name = f'{self.place_mode}{self._type_counters[self.place_mode]}'
             self.components.append(comp)
             self.place_mode = None
             self.ghost_pos = None
@@ -466,32 +485,58 @@ class CircuitCanvas(QWidget):
                 self.update()
             return
 
+        shift = bool(event.modifiers() & Qt.ShiftModifier)
+
         # 소자 클릭
         comp = self._hit_comp(x, y)
         if comp:
             if self.wiring:
                 self.wiring = False
                 self.wire_start = None
-            if self.selected_comp == comp:
-                # 드래그 시작 준비
-                self.dragging = True
-                self.drag_origin = (comp.x, comp.y)
+            if shift:
+                # Shift + 클릭: 기존 선택에 추가/제거 토글
+                if comp.id in self.selected_components:
+                    self.selected_components.discard(comp.id)
+                    comp.selected = False
+                    if self.selected_comp == comp:
+                        self.selected_comp = None
+                else:
+                    self.selected_components.add(comp.id)
+                    comp.selected = True
+                    self.selected_comp = comp
             else:
-                self.selected_comp = comp
-                comp.selected = True
-                for c in self.components:
-                    if c != comp:
+                if comp.id in self.selected_components and len(self.selected_components) > 1:
+                    # 이미 복수 선택된 소자 클릭 → 복수 드래그 시작
+                    self.multi_dragging = True
+                    self.multi_drag_origin = (x, y)
+                elif self.selected_comp == comp:
+                    # 단일 선택된 소자 재클릭 → 단일 드래그 시작
+                    self.dragging = True
+                    self.drag_origin = (comp.x, comp.y)
+                else:
+                    # 새 소자 단일 선택
+                    for c in self.components:
                         c.selected = False
+                    self.selected_components.clear()
+                    comp.selected = True
+                    self.selected_comp = comp
+                    self.selected_components.add(comp.id)
+            self._press_pos = (x, y)
             self.update()
             return
 
-        # 빈 곳 클릭 → 선택 해제
+        # 빈 곳 클릭/드래그 → 러버밴드 시작 준비
         if self.wiring:
             self.wiring = False
             self.wire_start = None
-        self.selected_comp = None
-        for c in self.components:
-            c.selected = False
+        self._press_pos = (x, y)
+        self.rubber_band_origin = (x, y)
+        if not shift:
+            # Shift 없으면 기존 선택 해제
+            self.selected_comp = None
+            self.selected_components.clear()
+            for c in self.components:
+                c.selected = False
         self.update()
 
     def mouseMoveEvent(self, event):
@@ -499,6 +544,18 @@ class CircuitCanvas(QWidget):
         if self.place_mode:
             self.ghost_pos = (snap(x), snap(y))
             self.update()
+        elif self.multi_dragging and self.multi_drag_origin:
+            # 복수 소자 드래그 이동
+            dx = snap(x) - snap(self.multi_drag_origin[0])
+            dy = snap(y) - snap(self.multi_drag_origin[1])
+            if dx != 0 or dy != 0:
+                for cid in self.selected_components:
+                    comp = self._comp_by_id(cid)
+                    if comp:
+                        comp.x += dx
+                        comp.y += dy
+                self.multi_drag_origin = (x, y)
+                self.update()
         elif self.dragging and self.selected_comp:
             self.selected_comp.x = snap(x)
             self.selected_comp.y = snap(y)
@@ -506,32 +563,140 @@ class CircuitCanvas(QWidget):
         elif self.wiring:
             self.wire_mouse_pos = (x, y)
             self.update()
+        elif self.rubber_band_origin and self._press_pos:
+            # 러버밴드 시작 판정 (10px 이상 이동)
+            px, py = self._press_pos
+            if not self.rubber_band_active and math.hypot(x - px, y - py) >= 10:
+                self.rubber_band_active = True
+            if self.rubber_band_active:
+                ox, oy = self.rubber_band_origin
+                rx = min(ox, x)
+                ry = min(oy, y)
+                rw = abs(x - ox)
+                rh = abs(y - oy)
+                self.rubber_band_rect = QRectF(rx, ry, rw, rh)
+                self.update()
 
     def mouseReleaseEvent(self, event):
-        if self.dragging:
+        if self.multi_dragging:
+            # 복수 드래그 종료: 스냅 정렬
+            self.multi_dragging = False
+            self.multi_drag_origin = None
+            for cid in self.selected_components:
+                comp = self._comp_by_id(cid)
+                if comp:
+                    comp.x = snap(comp.x)
+                    comp.y = snap(comp.y)
+            self.circuit_changed.emit()
+            self.update()
+        elif self.dragging:
             self.dragging = False
             self.circuit_changed.emit()
+
+        if self.rubber_band_active and self.rubber_band_rect:
+            # 러버밴드 선택 확정
+            shift = bool(event.modifiers() & Qt.ShiftModifier)
+            if not shift:
+                for c in self.components:
+                    c.selected = False
+                self.selected_components.clear()
+            for comp in self.components:
+                bbox = QRectF(comp.x - 35, comp.y - 18, 70, 36)
+                if self.rubber_band_rect.intersects(bbox):
+                    self.selected_components.add(comp.id)
+                    comp.selected = True
+            # selected_comp 동기화
+            if len(self.selected_components) == 1:
+                cid = next(iter(self.selected_components))
+                self.selected_comp = self._comp_by_id(cid)
+            else:
+                self.selected_comp = None
+        elif self._press_pos and self.rubber_band_origin and not self.rubber_band_active:
+            # 이동 < 10px: 빈 공간 클릭 → 전체 선택 해제 (Shift 없는 경우는 Press 시 이미 해제됨)
+            pass
+
+        # 러버밴드 상태 초기화
+        self.rubber_band_active = False
+        self.rubber_band_origin = None
+        self.rubber_band_rect = None
+        self._press_pos = None
+        self.update()
 
     def mouseDoubleClickEvent(self, event):
         x, y = event.x(), event.y()
         comp = self._hit_comp(x, y)
         if comp:
-            # 값 입력 다이얼로그
-            unit = {'R': 'Ω', 'L': 'nH', 'C': 'pF'}[comp.type]
-            cur = str(comp.value) if comp.value is not None else ''
-            val, ok = QInputDialog.getText(
-                self, f'{comp.type} 값 입력',
-                f'값을 입력하세요 (단위: {unit}):',
-                text=cur
-            )
-            if ok and val.strip():
-                try:
-                    comp.value = float(val.strip())
-                    comp.error_highlight = False
-                    self.circuit_changed.emit()
-                    self.update()
-                except ValueError:
-                    QMessageBox.warning(self, '입력 오류', '숫자를 입력하세요')
+            self._open_comp_dialog(comp)
+
+    def _open_comp_dialog(self, comp):
+        """소자 설정 커스텀 다이얼로그 (값 + 번호 수정)"""
+        unit = {'R': 'Ω', 'L': 'nH', 'C': 'pF'}[comp.type]
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f'{comp.name or comp.type} — 소자 설정')
+        dlg.setFixedWidth(280)
+        dlg_layout = QVBoxLayout(dlg)
+        dlg_layout.setSpacing(10)
+        dlg_layout.setContentsMargins(14, 14, 14, 14)
+
+        # 번호 행
+        num_row = QHBoxLayout()
+        num_row.addWidget(QLabel('번호:'))
+        num_row.addWidget(QLabel(comp.type))   # 접두어 (수정 불가)
+        cur_num = comp.name[len(comp.type):] if comp.name and comp.name.startswith(comp.type) else '1'
+        num_edit = QLineEdit(cur_num)
+        num_edit.setFixedWidth(60)
+        num_row.addWidget(num_edit)
+        num_row.addStretch()
+        dlg_layout.addLayout(num_row)
+
+        # 값 행
+        val_row = QHBoxLayout()
+        val_row.addWidget(QLabel('값:'))
+        val_edit = QLineEdit(str(comp.value) if comp.value is not None else '')
+        val_edit.setValidator(QDoubleValidator(0, 1e15, 6))
+        val_edit.setFixedWidth(100)
+        val_row.addWidget(val_edit)
+        val_row.addWidget(QLabel(unit))
+        val_row.addStretch()
+        dlg_layout.addLayout(val_row)
+
+        # 버튼 행
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton('Cancel')
+        ok_btn = QPushButton('OK')
+        ok_btn.setDefault(True)
+        cancel_btn.clicked.connect(dlg.reject)
+        ok_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(ok_btn)
+        dlg_layout.addLayout(btn_row)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        # 번호 적용 (중복 검사)
+        new_num_str = num_edit.text().strip()
+        if new_num_str:
+            new_name = f'{comp.type}{new_num_str}'
+            if new_name != comp.name:
+                dup = any(c.name == new_name for c in self.components if c.id != comp.id)
+                if dup:
+                    QMessageBox.warning(self, '번호 중복',
+                                        f'{new_name}은 이미 사용 중인 번호입니다')
+                    return
+                comp.name = new_name
+
+        # 값 적용
+        val_str = val_edit.text().strip()
+        if val_str:
+            try:
+                comp.value = float(val_str)
+                comp.error_highlight = False
+                self.circuit_changed.emit()
+                self.update()
+            except ValueError:
+                QMessageBox.warning(self, '입력 오류', '숫자를 입력하세요')
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -542,17 +707,22 @@ class CircuitCanvas(QWidget):
             self.wire_start = None
             self.setCursor(Qt.ArrowCursor)
             self.update()
-        elif key == Qt.Key_R and self.selected_comp:
-            # 90° 회전
-            self.selected_comp.horizontal = not self.selected_comp.horizontal
+        elif key == Qt.Key_R and self.selected_components:
+            # 선택된 모든 소자 90° 개별 회전
+            for cid in self.selected_components:
+                comp = self._comp_by_id(cid)
+                if comp:
+                    comp.horizontal = not comp.horizontal
             self.circuit_changed.emit()
             self.update()
-        elif key == Qt.Key_Delete and self.selected_comp:
-            # 소자 삭제
-            cid = self.selected_comp.id
-            self.components = [c for c in self.components if c.id != cid]
+        elif key == Qt.Key_Delete and self.selected_components:
+            # 선택된 모든 소자 일괄 삭제
+            ids_to_delete = set(self.selected_components)
+            self.components = [c for c in self.components if c.id not in ids_to_delete]
             self.wires = [w for w in self.wires
-                          if w.start_comp_id != cid and w.end_comp_id != cid]
+                          if w.start_comp_id not in ids_to_delete
+                          and w.end_comp_id not in ids_to_delete]
+            self.selected_components.clear()
             self.selected_comp = None
             self.circuit_changed.emit()
             self.update()
@@ -585,6 +755,12 @@ class CircuitCanvas(QWidget):
         # 고스트
         if self.place_mode and self.ghost_pos:
             self._draw_ghost(painter)
+
+        # 러버밴드 선택 사각형
+        if self.rubber_band_active and self.rubber_band_rect:
+            painter.setBrush(QBrush(QColor(0, 120, 215, 40)))
+            painter.setPen(QPen(QColor(0, 120, 215, 180), 1))
+            painter.drawRect(self.rubber_band_rect)
 
         painter.end()
 
@@ -652,6 +828,19 @@ class CircuitCanvas(QWidget):
             self._draw_symbol_h(painter, comp.type, x, y)
         else:
             self._draw_symbol_v(painter, comp.type, x, y)
+
+        # 번호 레이블 (파란 이탤릭, 항상 수평)
+        if comp.name:
+            name_font = QFont('Arial', 9)
+            name_font.setItalic(True)
+            painter.setFont(name_font)
+            painter.setPen(QPen(QColor('#0000FF'), 1))
+            if comp.horizontal:
+                # 수평 소자: 소자 중심 위, 수평 중앙 정렬
+                painter.drawText(x - 15, y - 14, comp.name)
+            else:
+                # 수직 소자: 좌측 상단 (항상 수평 텍스트)
+                painter.drawText(x - 28, y - 18, comp.name)
 
         # 값 레이블
         font = QFont('Arial', 9)
@@ -1242,7 +1431,7 @@ class SensitivityWorker(QObject):
                     continue
                 t = comp.type
                 type_idx[t] = type_idx.get(t, 0) + 1
-                name = f'{t}{type_idx[t]}'
+                name = comp.name if comp.name else f'{t}{type_idx[t]}'
                 unit = {'R': 'Ω', 'L': 'nH', 'C': 'pF'}[t]
                 xi = comp.value
 
@@ -1345,6 +1534,13 @@ class SensitivityWindow(QDialog):
         table.setAlternatingRowColors(False)
 
         sorted_r = sorted(self.results, key=lambda r: r['rank'])
+
+        # 그라데이션 하이라이트 설정: 소자 >5개이면 상위 5개, 이하이면 상위 3개
+        highlight_count = 5 if n > 5 else 3
+        max_abs = abs(sorted_r[0]['norm_sens']) if sorted_r else 1.0
+        if max_abs == 0:
+            max_abs = 1.0
+
         for row_idx, r in enumerate(sorted_r):
             texts = [
                 r['name'],
@@ -1353,15 +1549,16 @@ class SensitivityWindow(QDialog):
                 f"{r['norm_sens']:.4f}",
                 str(r['rank']),
             ]
+            # 그라데이션 배경 계산
+            alpha = abs(r['norm_sens']) / max_abs if r['rank'] <= highlight_count else 0.0
             for col, text in enumerate(texts):
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignCenter)
-                # Rank 1 행: 연분홍 배경
-                if r['rank'] == 1:
-                    item.setBackground(QColor('#FFEBEE'))
-                # L 소자: 연파랑 텍스트
-                if r['type'] == 'L':
-                    item.setForeground(QColor('#1565C0'))
+                # 상위 N개 행: |Norm.S| 비례 그라데이션 배경
+                if r['rank'] <= highlight_count:
+                    g_val = 255 - round(alpha * 30)
+                    b_val = 255 - round(alpha * 37)
+                    item.setBackground(QColor(255, g_val, b_val))
                 table.setItem(row_idx, col, item)
 
         content.addWidget(table, stretch=45)
@@ -1563,24 +1760,23 @@ class MainWindow(QMainWindow):
 
     def _open_sensitivity(self):
         """Sensitivity Analysis 버튼 처리"""
-        # Cal 완료 여부 확인
-        if self.last_freqs is None or self.last_Z is None:
-            QMessageBox.warning(self, '안내',
-                                'Cal 버튼으로 먼저 회로를 계산하세요')
-            return
-
-        # 회로 유효성 검증
+        # 회로 유효성 검증 (Cal 결과 불필요)
         valid, err = self.circuit_canvas.validate_circuit()
         if not valid:
             QMessageBox.warning(self, '회로 오류', err)
             return
 
-        # 분석 주파수 입력 (기본값: 주파수 범위 중간)
-        f_default = (self.last_freqs[0] + self.last_freqs[-1]) / 2
+        # 소자 수 검증
+        connected_comps = [c for c in self.circuit_canvas.components if c.value is not None]
+        if len(connected_comps) < 2:
+            QMessageBox.warning(self, '안내', '민감도 분석에는 최소 2개 이상의 소자가 필요합니다')
+            return
+
+        # 주파수 입력 (기본값 13.56 MHz, Cal 결과와 무관)
         f_str, ok = QInputDialog.getText(
             self, '민감도 분석 — 주파수 설정',
             '분석 주파수 (MHz):',
-            text=f'{f_default:.3f}'
+            text='13.56'
         )
         if not ok or not f_str.strip():
             return
