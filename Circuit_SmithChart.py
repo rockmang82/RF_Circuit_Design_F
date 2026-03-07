@@ -11,7 +11,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QPushButton, QLabel, QLineEdit,
     QMessageBox, QInputDialog, QDialog, QComboBox, QProgressDialog,
-    QSizePolicy, QStatusBar, QTableWidget, QTableWidgetItem, QHeaderView
+    QSizePolicy, QStatusBar, QTableWidget, QTableWidgetItem, QHeaderView,
+    QFileDialog, QMenu
 )
 from PyQt5.QtCore import (
     Qt, QPointF, QRectF, QThread, pyqtSignal, QObject
@@ -24,6 +25,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+import json
 
 
 # ──────────────────────────────────────────────
@@ -707,6 +709,18 @@ class CircuitCanvas(QWidget):
             self.wire_start = None
             self.setCursor(Qt.ArrowCursor)
             self.update()
+        elif key == Qt.Key_L and not self.selected_comp and not self.selected_components:
+            # L 배치 단축키 (선택 없을 때)
+            self.enter_place_mode('L')
+            return
+        elif key == Qt.Key_C and not self.selected_comp and not self.selected_components:
+            # C 배치 단축키 (선택 없을 때)
+            self.enter_place_mode('C')
+            return
+        elif key == Qt.Key_R and not self.selected_comp and not self.selected_components:
+            # R 배치 단축키 (선택 없을 때)
+            self.enter_place_mode('R')
+            return
         elif key == Qt.Key_R and self.selected_components:
             # 선택된 모든 소자 90° 개별 회전
             for cid in self.selected_components:
@@ -1144,7 +1158,7 @@ class SmithChartWidget(QWidget):
         self.canvas.draw()
 
     def _on_click(self, event):
-        """Smith Chart 클릭 → 사용자 마커"""
+        """Smith Chart 클릭 → 주파수 팝업 → 사용자 마커"""
         if self.freqs is None or self.Z_data is None:
             return
         if event.inaxes != self.ax:
@@ -1155,9 +1169,26 @@ class SmithChartWidget(QWidget):
         gx = gamma.real
         gy = gamma.imag
 
-        # 가장 가까운 주파수 포인트
+        # 가장 가까운 주파수 포인트 (default 값)
         dist = (gx - cx) ** 2 + (gy - cy) ** 2
-        idx = np.argmin(dist)
+        idx_default = np.argmin(dist)
+        f_default = self.freqs[idx_default]
+
+        # ★ 주파수 입력 팝업 (QInputDialog)
+        f_str, ok = QInputDialog.getText(
+            self.parent(), '마커 주파수 설정',
+            '주파수 (MHz):',
+            text=f'{f_default:.4f}'
+        )
+        if not ok or not f_str.strip():
+            return
+        try:
+            f_input = float(f_str.strip())
+        except ValueError:
+            return
+
+        # 입력된 주파수에 가장 가까운 데이터 포인트 찾기
+        idx = np.argmin(np.abs(self.freqs - f_input))
         f = self.freqs[idx]
         Z = self.Z_data[idx]
         g = gamma[idx]
@@ -1165,8 +1196,12 @@ class SmithChartWidget(QWidget):
         # 기존 마커 제거
         if self.user_marker:
             for art in self.user_marker:
-                art.remove()
+                try:
+                    art.remove()
+                except Exception:
+                    pass
 
+        # 마커 생성
         marker_pt, = self.ax.plot(gx[idx], gy[idx], 'o', color='#FF9800',
                                    markersize=8, zorder=6)
         label_txt = self.ax.annotate(
@@ -1188,7 +1223,10 @@ class AdvancedWindow(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Advanced - Impedance Analysis')
-        self.setWindowFlags(self.windowFlags() | Qt.Window)
+        self.setWindowFlags(
+            (self.windowFlags() | Qt.Window)
+            & ~Qt.WindowContextHelpButtonHint
+        )
         self.resize(800, 600)
         self.setMinimumSize(600, 400)
 
@@ -1211,7 +1249,7 @@ class AdvancedWindow(QDialog):
 
         # 툴바
         toolbar = QHBoxLayout()
-        toolbar.addWidget(QLabel('Scale:'))
+        toolbar.addWidget(QLabel('Y Scale:'))
         self.scale_combo = QComboBox()
         self.scale_combo.addItems(['Linear', 'Logarithmic'])
         self.scale_combo.currentIndexChanged.connect(self._on_scale_changed)
@@ -1300,8 +1338,10 @@ class AdvancedWindow(QDialog):
         self.ax_mag.set_xlabel('Frequency (MHz)')
         ylabel = f'Magnitude ({mag_unit})'
         self.ax_mag.set_ylabel(ylabel)
-        xscale = 'log' if scale == 'Logarithmic' else 'linear'
-        self.ax_mag.set_xscale(xscale)
+        # Y축 Scale: Magnitude에만 적용 (X축은 항상 Linear 고정)
+        yscale = 'log' if scale == 'Logarithmic' else 'linear'
+        self.ax_mag.set_xscale('linear')
+        self.ax_mag.set_yscale(yscale)
 
         # Phase 플롯
         self.ax_phase.plot(freqs, phase, color='#E53935', lw=1.5)
@@ -1311,7 +1351,8 @@ class AdvancedWindow(QDialog):
         self.ax_phase.set_ylabel('Phase (°)')
         self.ax_phase.set_ylim(-180, 180)
         self.ax_phase.set_yticks([-180, -135, -90, -45, 0, 45, 90, 135, 180])
-        self.ax_phase.set_xscale(xscale)
+        # Phase X축도 항상 Linear, Y축도 항상 Linear 고정
+        self.ax_phase.set_xscale('linear')
 
         # 커서 초기화
         self.cursor_line1 = None
@@ -1496,7 +1537,10 @@ class SensitivityWindow(QDialog):
     def __init__(self, f_mhz, z_nominal, results, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Sensitivity Analysis Results')
-        self.setWindowFlags(self.windowFlags() | Qt.Window)
+        self.setWindowFlags(
+            (self.windowFlags() | Qt.Window)
+            & ~Qt.WindowContextHelpButtonHint
+        )
         self.resize(1020, 480)
         self.setMinimumSize(760, 380)
         self.f_mhz = f_mhz
@@ -1533,9 +1577,16 @@ class SensitivityWindow(QDialog):
         )
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         table.setEditTriggers(QTableWidget.NoEditTriggers)
-        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setSelectionMode(QTableWidget.ExtendedSelection)
+        table.setSelectionBehavior(QTableWidget.SelectItems)
         table.verticalHeader().setVisible(True)
         table.setAlternatingRowColors(False)
+
+        # 우클릭 컨텍스트 메뉴 (클립보드 복사)
+        table.setContextMenuPolicy(Qt.CustomContextMenu)
+        table.customContextMenuRequested.connect(
+            lambda pos: self._show_table_context_menu(table, pos)
+        )
 
         sorted_r = sorted(self.results, key=lambda r: r['rank'])
 
@@ -1620,6 +1671,49 @@ class SensitivityWindow(QDialog):
 
         layout.addLayout(content)
 
+    def _show_table_context_menu(self, table, pos):
+        """테이블 우클릭 메뉴"""
+        menu = QMenu(self)
+        copy_action = menu.addAction('클립보드에 복사')
+        action = menu.exec_(table.viewport().mapToGlobal(pos))
+        if action == copy_action:
+            self._copy_selection_to_clipboard(table)
+
+    def _copy_selection_to_clipboard(self, table):
+        """선택된 셀을 탭 구분 텍스트(TSV)로 클립보드에 복사"""
+        selection = table.selectedRanges()
+        if not selection:
+            return
+
+        rows = set()
+        cols = set()
+        for sel_range in selection:
+            for r in range(sel_range.topRow(), sel_range.bottomRow() + 1):
+                rows.add(r)
+            for c in range(sel_range.leftColumn(), sel_range.rightColumn() + 1):
+                cols.add(c)
+
+        rows = sorted(rows)
+        cols = sorted(cols)
+
+        # 헤더 포함
+        header_texts = []
+        for c in cols:
+            header_item = table.horizontalHeaderItem(c)
+            header_texts.append(header_item.text() if header_item else '')
+        lines = ['\t'.join(header_texts)]
+
+        # 데이터 행
+        for r in rows:
+            row_texts = []
+            for c in cols:
+                item = table.item(r, c)
+                row_texts.append(item.text() if item else '')
+            lines.append('\t'.join(row_texts))
+
+        text = '\n'.join(lines)
+        QApplication.clipboard().setText(text)
+
 
 # ──────────────────────────────────────────────
 # 메인 윈도우
@@ -1686,6 +1780,18 @@ class MainWindow(QMainWindow):
         self.cal_btn.clicked.connect(self._on_calculate)
         toolbar_layout.addWidget(self.cal_btn)
 
+        # Save 버튼
+        self.save_btn = QPushButton('Save')
+        self.save_btn.setFixedSize(50, 28)
+        self.save_btn.clicked.connect(self._on_save)
+        toolbar_layout.addWidget(self.save_btn)
+
+        # Load 버튼
+        self.load_btn = QPushButton('Load')
+        self.load_btn.setFixedSize(50, 28)
+        self.load_btn.clicked.connect(self._on_load)
+        toolbar_layout.addWidget(self.load_btn)
+
         toolbar_layout.addStretch()
 
         main_layout.addWidget(toolbar_widget)
@@ -1750,6 +1856,108 @@ class MainWindow(QMainWindow):
         # 상태바
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage('준비')
+
+    def _on_save(self):
+        """회로를 JSON 파일로 저장"""
+        path, _ = QFileDialog.getSaveFileName(
+            self, '회로 저장', '', 'JSON Files (*.json);;All Files (*)'
+        )
+        if not path:
+            return
+        data = {
+            'version': 1,
+            'freq_start_mhz': self.freq_start.text(),
+            'freq_stop_mhz': self.freq_stop.text(),
+            'type_counters': self.circuit_canvas._type_counters.copy(),
+            'components': [
+                {
+                    'id': c.id,
+                    'type': c.type,
+                    'name': c.name,
+                    'x': c.x,
+                    'y': c.y,
+                    'value': c.value,
+                    'horizontal': c.horizontal,
+                }
+                for c in self.circuit_canvas.components
+            ],
+            'wires': [
+                {
+                    'start_comp_id': w.start_comp_id,
+                    'start_pin_idx': w.start_pin_idx,
+                    'end_comp_id': w.end_comp_id,
+                    'end_pin_idx': w.end_pin_idx,
+                }
+                for w in self.circuit_canvas.wires
+            ],
+        }
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.statusBar().showMessage(f'저장 완료: {path}')
+        except Exception as e:
+            QMessageBox.warning(self, '저장 오류', f'저장 중 오류 발생:\n{e}')
+
+    def _on_load(self):
+        """JSON 파일에서 회로 불러오기"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, '회로 불러오기', '', 'JSON Files (*.json);;All Files (*)'
+        )
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.warning(self, '불러오기 오류', f'파일 읽기 오류:\n{e}')
+            return
+
+        # 기존 데이터 초기화
+        self.circuit_canvas.components.clear()
+        self.circuit_canvas.wires.clear()
+        self.circuit_canvas.selected_comp = None
+        self.circuit_canvas.selected_components.clear()
+
+        # 주파수 복원
+        self.freq_start.setText(data.get('freq_start_mhz', '1'))
+        self.freq_stop.setText(data.get('freq_stop_mhz', '100'))
+
+        # 타입 카운터 복원
+        self.circuit_canvas._type_counters = data.get(
+            'type_counters', {'R': 0, 'L': 0, 'C': 0}
+        )
+
+        # 소자 복원
+        for cd in data.get('components', []):
+            comp = Component(cd['type'], cd['x'], cd['y'])
+            comp.id = cd['id']
+            comp.name = cd.get('name')
+            comp.value = cd.get('value')
+            comp.horizontal = cd.get('horizontal', True)
+            self.circuit_canvas.components.append(comp)
+
+        # Component._id_counter 복원 (최대 id + 1)
+        if self.circuit_canvas.components:
+            Component._id_counter = max(c.id for c in self.circuit_canvas.components)
+
+        # 와이어 복원 (start_comp_id가 정수면 int로 변환)
+        for wd in data.get('wires', []):
+            s_id = wd['start_comp_id']
+            e_id = wd['end_comp_id']
+            if isinstance(s_id, str) and s_id.lstrip('-').isdigit():
+                s_id = int(s_id)
+            if isinstance(e_id, str) and e_id.lstrip('-').isdigit():
+                e_id = int(e_id)
+            wire = Wire(s_id, wd['start_pin_idx'], e_id, wd['end_pin_idx'])
+            self.circuit_canvas.wires.append(wire)
+
+        # Cal 결과 초기화 (저장되지 않으므로)
+        self.last_freqs = None
+        self.last_Z = None
+        self.smith_widget._draw_smith_background()
+
+        self.circuit_canvas.update()
+        self.statusBar().showMessage(f'불러오기 완료: {path}')
 
     def _open_advanced(self):
         """Advanced 윈도우 열기"""
