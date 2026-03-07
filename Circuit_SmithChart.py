@@ -1445,11 +1445,15 @@ class SensitivityWorker(QObject):
                 if Z_plus is None or Z_minus is None:
                     continue
 
-                dZ = Z_plus - Z_minus
-                # 절대 민감도 |ΔZ/ΔXi| — Ω/unit (실수부 부호 유지)
-                abs_sens = (dZ / (2.0 * xi * self.eps)).real
-                # 정규화 민감도 (ΔZ/Z) / (ΔXi/Xi) = dZ/(2*Z0*eps)
-                norm_sens = (dZ / (2.0 * Z0 * self.eps)).real
+                # |Z| 기반 민감도: L/C는 순허수라 .real 취하면 0이 되므로 크기 기반으로 계산
+                abs_Z_plus  = abs(Z_plus)
+                abs_Z_minus = abs(Z_minus)
+                abs_Z0      = abs(Z0)
+
+                # 절대 민감도: Δ|Z| / ΔXi  (단위: Ω/unit, 부호 보존)
+                abs_sens = (abs_Z_plus - abs_Z_minus) / (2.0 * xi * self.eps)
+                # 정규화 민감도: (Δ|Z|/|Z|) / (ΔXi/Xi)  (무차원, 부호 보존)
+                norm_sens = abs_sens * (xi / abs_Z0) if abs_Z0 != 0 else 0.0
 
                 # 값 표시 문자열 (정수면 정수형, 소수면 소수형)
                 if xi == int(xi):
